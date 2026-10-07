@@ -1,6 +1,7 @@
 import os
 import string
-
+import time
+from functools import wraps
 from flask import Flask, request, redirect, jsonify
 import redis
 import psycopg2
@@ -10,6 +11,10 @@ app = Flask(__name__)
 # Define the 62 characters used for short codes (0-9, a-z, A-Z) (Base62)
 ALPHABET = string.digits + string.ascii_lowercase + string.ascii_uppercase
 
+# Configuration: Max 15 requests, refilling 1 token every 2 seconds
+BUCKET_LIMIT = 15
+REFILL_RATE = 0.5  # tokens per second
+
 # Connect to Redis for fast lookups
 cache = redis.Redis(
     host=os.environ.get("REDIS_HOST", "redis"),
@@ -17,6 +22,46 @@ cache = redis.Redis(
     decode_responses=True,
 )
 
+def token_bucket(f):
+    """Decorator to implement token bucket rate limiting."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Identify the user using their IP address
+        user_ip = request.remote_addr
+        redis_key = f"bucket:{user_ip}"
+        
+        # Fetch current bucket state from Redis
+        state = cache.hgetall(redis_key)
+        current_time = time.time()
+        
+        if not state:
+            # If the user has no bucket yet, initialize it to full capacity
+            tokens = BUCKET_LIMIT
+            last_updated = current_time
+        else:
+            tokens = float(state["tokens"])
+            last_updated = float(state["last_updated"])
+            
+            # Refill the bucket based on how much time has passed
+            elapsed_time = current_time - last_updated
+            tokens = min(BUCKET_LIMIT, tokens + (elapsed_time * REFILL_RATE))
+        
+        # Check if there are enough tokens to allow the request
+        if tokens >= 1:
+            tokens -= 1  # Spend 1 token
+            
+            # Save updated state back to Redis
+            cache.hset(redis_key, mapping={
+                "tokens": tokens,
+                "last_updated": current_time
+            })
+            
+            return f(*args, **kwargs)
+        else:
+            # Bucket is empty! Reject request
+            return jsonify({"error": "Too many requests. Please try again later."}), 429
+            
+    return decorated_function
 
 def get_db():
     """Connect to PostgreSQL for permanent storage."""
@@ -45,6 +90,7 @@ def base62_decode(s):
     return num
 
 @app.route("/shorten", methods=["POST"])
+@token_bucket
 def shorten_url():
     """Endpoint to shorten a long URL."""
     # Grab the long URL from the request body
